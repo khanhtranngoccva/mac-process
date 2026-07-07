@@ -1,0 +1,204 @@
+//! Types and functions for macOS-specific files and file descriptors used by processes.
+use std::{
+    io,
+    mem::{self, MaybeUninit},
+};
+
+use crate::{
+    helpers::syscall,
+    libproc::{
+        bindings,
+        proc_pid::{ListPIDInfo, PidInfoFlavor},
+    },
+};
+use libc::c_void;
+
+/// Flavor of Pid `FileDescriptor` info for different types of File Descriptors
+pub enum PIDFDInfoFlavor {
+    /// `VNodeInfo`
+    VNodeInfo = 1,
+    /// `VNodePathInfo`
+    VNodePathInfo = 2,
+    /// `SocketInfo`
+    SocketInfo = 3,
+    /// `PSEMInfo`
+    PSEMInfo = 4,
+    /// `PSHMInfo`
+    PSHMInfo = 5,
+    /// `PipeInfo`
+    PipeInfo = 6,
+    /// `KQueueInfo`
+    KQueueInfo = 7,
+    /// `AppleTalkInfo`
+    ATalkInfo = 8,
+}
+
+/// Struct for Listing File Descriptors
+pub struct ListFDs;
+
+impl ListPIDInfo for ListFDs {
+    type Item = ProcFDInfo;
+
+    fn flavor() -> PidInfoFlavor {
+        PidInfoFlavor::ListFDs
+    }
+}
+
+/// Struct to hold info about a Processes `FileDescriptor` Info
+#[repr(C)]
+pub struct ProcFDInfo {
+    /// `FileDescriptor`
+    pub proc_fd: i32,
+    /// `FileDescriptor` type
+    pub proc_fdtype: u32,
+}
+
+/// Enum for different `FileDescriptor` types
+#[derive(Copy, Clone, Debug)]
+pub enum ProcFDType {
+    /// `AppleTalk`
+    ATalk = 0,
+    /// Vnode
+    VNode = 1,
+    /// Socket
+    Socket = 2,
+    /// POSIX shared memory
+    PSHM = 3,
+    /// POSIX semaphore
+    PSEM = 4,
+    /// Kqueue
+    KQueue = 5,
+    /// Pipe
+    Pipe = 6,
+    /// `FSEvents`
+    FSEvents = 7,
+    /// `NetPolicy`
+    NetPolicy = 9,
+    /// Unknown
+    Unknown,
+}
+
+impl From<u32> for ProcFDType {
+    fn from(value: u32) -> ProcFDType {
+        match value {
+            0 => ProcFDType::ATalk,
+            1 => ProcFDType::VNode,
+            2 => ProcFDType::Socket,
+            3 => ProcFDType::PSHM,
+            4 => ProcFDType::PSEM,
+            5 => ProcFDType::KQueue,
+            6 => ProcFDType::Pipe,
+            7 => ProcFDType::FSEvents,
+            _ => ProcFDType::Unknown,
+        }
+    }
+}
+
+/// The `PIDFDInfo` trait is needed for polymorphism on pidfdinfo types, also abstracting flavor
+/// in order to provide type-guaranteed flavor correctness
+pub trait PIDFDInfo {
+    /// Return the Pid File Descriptor Info flavor of the implementing struct
+    fn flavor() -> PIDFDInfoFlavor;
+}
+
+/// Returns the information about file descriptors of the process that match pid passed in.
+///
+/// # Errors
+///
+/// Will return `Err`if the underlying Darwin method `proc_pidfdinfo` returns 0
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Write;
+/// use std::net::TcpListener;
+/// use mac_process::libproc::proc_pid::{listpidinfo, pidinfo};
+/// use mac_process::libproc::bsd_info::{BSDInfo};
+/// use mac_process::libproc::net_info::{SocketFDInfo, SocketInfoKind};
+/// use mac_process::libproc::file_info::{pidfdinfo, ListFDs, ProcFDType};
+/// use std::process;
+///
+/// let pid = process::id() as i32;
+///
+/// // Open TCP port:8000 to test.
+/// let _listener = TcpListener::bind("127.0.0.1:8000");
+///
+/// let info = pidinfo::<BSDInfo>(pid, 0).expect("Could not get BSDInfo on {pid}");///
+/// let fds = listpidinfo::<ListFDs>(pid, info.pbi_nfiles as usize)
+///     .expect("Could not list FD of {pid}");
+/// for fd in &fds {
+///     if let(ProcFDType::Socket) = fd.proc_fdtype.into() {
+///         let socket = pidfdinfo::<SocketFDInfo>(pid, fd.proc_fd)
+///             .expect("Could not get SocketFDInfo");
+///         if let(SocketInfoKind::Tcp) = socket.psi.soi_kind.into() {
+///             // access to the member of `soi_proto` is unsafe becasuse of union type.
+///             let info = unsafe { socket.psi.soi_proto.pri_tcp };
+///
+///             // change endian and cut off because insi_lport is network endian and 16bit witdh.
+///             let mut port = 0;
+///             port |= info.tcpsi_ini.insi_lport >> 8 & 0x00ff;
+///             port |= info.tcpsi_ini.insi_lport << 8 & 0xff00;
+///
+///             // access to the member of `insi_laddr` is unsafe becasuse of union type.
+///             let s_addr = unsafe { info.tcpsi_ini.insi_laddr.ina_46.i46a_addr4.s_addr };
+///
+///             // change endian because insi_laddr is network endian.
+///             let mut addr = 0;
+///             addr |= s_addr >> 24 & 0x000000ff;
+///             addr |= s_addr >> 8  & 0x0000ff00;
+///             addr |= s_addr << 8  & 0x00ff0000;
+///             addr |= s_addr << 24 & 0xff000000;
+///
+///             println!("{}.{}.{}.{}:{}", addr >> 24 & 0xff, addr >> 16 & 0xff, addr >> 8 & 0xff,
+///                         addr & 0xff, port);
+///         }
+///     }
+/// }
+/// ```
+pub fn pidfdinfo<T: PIDFDInfo>(pid: i32, fd: i32) -> Result<T, io::Error> {
+    let flavor = T::flavor() as i32;
+    // No `T` will have size greater than `i32::MAX` so no truncation
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let buffer_size = mem::size_of::<T>() as i32;
+    let mut pidinfo = MaybeUninit::<T>::uninit();
+    #[allow(clippy::pedantic)]
+    let buffer_ptr = &mut pidinfo as *mut _ as *mut c_void;
+
+    syscall::cvt_positive(unsafe {
+        bindings::proc_pidfdinfo(pid, fd, flavor, buffer_ptr, buffer_size)
+    })?;
+    Ok(unsafe { pidinfo.assume_init() })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod test {
+    use super::pidfdinfo;
+    use crate::libproc::bsd_info::BSDInfo;
+    use crate::libproc::file_info::{ListFDs, ProcFDType};
+    use crate::libproc::net_info::{SocketFDInfo, SocketInfoKind};
+    use crate::libproc::proc_pid::{listpidinfo, pidinfo};
+    use std::process;
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn pidfdinfo_test() {
+        let pid = process::id() as i32;
+
+        let info = pidinfo::<BSDInfo>(pid, 0).expect("pidinfo() failed");
+        let fds =
+            listpidinfo::<ListFDs>(pid, info.pbi_nfiles as usize).expect("listpidinfo() failed");
+        for fd in fds {
+            if let ProcFDType::Socket = fd.proc_fdtype.into() {
+                let socket =
+                    pidfdinfo::<SocketFDInfo>(pid, fd.proc_fd).expect("pidfdinfo() failed");
+                if let SocketInfoKind::Tcp = socket.psi.soi_kind.into() {
+                    unsafe {
+                        let info = socket.psi.soi_proto.pri_tcp;
+                        assert_eq!(socket.psi.soi_protocol, libc::IPPROTO_TCP);
+                        assert_eq!(info.tcpsi_ini.insi_lport, 65535);
+                    }
+                }
+            }
+        }
+    }
+}
