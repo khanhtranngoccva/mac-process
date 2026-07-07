@@ -13,7 +13,7 @@ This is a divergent fork/port of [libproc-rs](https://github.com/andrewdavidmack
 - Supports opening the main executable over `/.vol` for checking its contents (e.g. MD5 and SHA256 hashes).
 
 ## Credits
-Certain parts of this codebase are directly reused here.
+Certain parts of this codebase are directly reused here. Please give them support:
 - [libproc-rs](https://github.com/andrewdavidmackenzie/libproc-rs/) by [andrewdavidmackenzie](https://github.com/andrewdavidmackenzie)
 - [endpoint-sec](https://github.com/HarfangLab/endpoint-sec) by [HarfangLab](https://github.com/HarfangLab)
 
@@ -22,6 +22,7 @@ See the original repo (https://github.com/andrewdavidmackenzie/libproc-rs) for m
 
 ## TODO
 - Introduce signature verification for MacOS binaries
+- Implement other high-level APIs
 - Discuss re-merging with `libproc-rs` for completeness
 - Figure out whether custom error types are needed
 

@@ -2,6 +2,12 @@
 name = "mac-process"
 version = "0.1.0"
 edition = "2024"
+description = "User-mode library for querying and verifying integrity of MacOS processes"
+readme = "README.md"
+repository = "https://github.com/khanhtranngoccva/mac-process"
+license = "MIT"
+keywords = ["macos", "process", "libproc"]
+categories = ["os::macos-apis", "api-bindings", "authentication"]
 
 [dependencies]
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
