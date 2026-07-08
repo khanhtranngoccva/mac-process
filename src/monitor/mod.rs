@@ -362,6 +362,7 @@ impl Process {
     }
 
     /// Computes the MD5 hash of the main executable. This property is cached.
+    #[doc(hidden)]
     pub fn md5_exe(&self) -> Result<[u8; 16], io::Error> {
         self.evaluate_cached(&self.md5_exe, || {
             let file = self.open_exe(OFlags::empty())?;
@@ -370,13 +371,26 @@ impl Process {
         .copied()
     }
 
+    /// Computes the MD5 hash of the main executable. This property is cached.
+    #[inline]
+    pub fn exe_md5(&self) -> Result<[u8; 16], io::Error> {
+        self.md5_exe()
+    }
+
     /// Computes the SHA256 hash of the main executable. This property is cached.
+    #[doc(hidden)]
     pub fn sha256_exe(&self) -> Result<[u8; 32], io::Error> {
         self.evaluate_cached(&self.sha256_exe, || {
             let file = self.open_exe(OFlags::empty())?;
             hashes::compute_sha256(file)
         })
         .copied()
+    }
+
+    /// Computes the SHA256 hash of the main executable. This property is cached.
+    #[inline]
+    pub fn exe_sha256(&self) -> Result<[u8; 32], io::Error> {
+        self.sha256_exe()
     }
 }
 
