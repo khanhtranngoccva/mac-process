@@ -1,22 +1,38 @@
 //! High-level types and functions for vnode information
+use crate::{
+    helpers::time,
+    libproc::{
+        bindings::{proc_vnodepathinfo, vinfo_stat, vnode_info, vnode_info_path},
+        file_info::ProcFDType,
+    },
+};
 use core::slice;
+use ref_cast::RefCast;
+use rustix::fs::{Dev, FileType, Fsid, Gid, Mode, OFlags, RawMode, Uid};
 use std::{
     ffi::{CStr, OsStr},
     fmt::Debug,
-    os::unix::ffi::OsStrExt,
+    io,
+    os::{fd::OwnedFd, unix::ffi::OsStrExt},
     path::Path,
     time::SystemTime,
 };
 
-use crate::{
-    helpers::time,
-    libproc::{
-        bindings::{vinfo_stat, vnode_info, vnode_info_path},
-        file_info::ProcFDType,
-    },
-};
-use ref_cast::RefCast;
-use rustix::fs::{Dev, FileType, Fsid, Gid, Mode, RawMode, Uid};
+/// Trait for types that can be opened as a file.
+pub trait Openable {
+    /// Returns the identity of the file (combination of device and inode)
+    fn identity(&self) -> (Dev, u64);
+
+    /// Opens the file using the identity from `/.vol` and returns an OwnedFd descriptor.
+    fn open(&self, flags: OFlags) -> Result<OwnedFd, io::Error> {
+        let (dev, ino) = self.identity();
+        let stable_path = Path::new("/.vol")
+            .join(dev.to_string())
+            .join(ino.to_string());
+        let owned_fd = rustix::fs::open(stable_path, flags, Mode::empty())?;
+        Ok(owned_fd)
+    }
+}
 
 /// A high-level representation of a vnode stat returned by `libproc`
 #[repr(transparent)]
@@ -155,6 +171,12 @@ impl Debug for VnodeStat {
     }
 }
 
+impl Openable for VnodeStat {
+    fn identity(&self) -> (Dev, u64) {
+        (self.dev(), self.ino())
+    }
+}
+
 /// A high-level representation of a vnode returned by `libproc`
 #[repr(transparent)]
 #[derive(RefCast, Clone, Copy)]
@@ -206,6 +228,12 @@ impl Debug for Vnode {
     }
 }
 
+impl Openable for Vnode {
+    fn identity(&self) -> (Dev, u64) {
+        self.stat().identity()
+    }
+}
+
 /// A high-level representation of a vnode path returned by `libproc`
 #[repr(transparent)]
 #[derive(RefCast, Clone, Copy)]
@@ -249,5 +277,40 @@ impl Debug for VnodeWithPath {
             .field("vnode", &self.vnode())
             .field("path", &self.path())
             .finish()
+    }
+}
+
+impl Openable for VnodeWithPath {
+    fn identity(&self) -> (Dev, u64) {
+        self.vnode().identity()
+    }
+}
+
+/// A high-level representation of path states of a process returned by `libproc`
+#[repr(transparent)]
+#[derive(RefCast, Clone, Copy)]
+pub struct ProcessVnodePaths {
+    raw: proc_vnodepathinfo,
+}
+
+impl ProcessVnodePaths {
+    /// Creates a new process vnode paths structure from a raw process vnode path info
+    pub fn from_raw(raw: proc_vnodepathinfo) -> Self {
+        Self { raw }
+    }
+
+    /// Returns the raw version
+    pub fn as_raw(&self) -> &proc_vnodepathinfo {
+        &self.raw
+    }
+
+    /// Returns the current working directory of the process
+    pub fn cwd(&self) -> &VnodeWithPath {
+        VnodeWithPath::ref_cast(&self.raw.pvi_cdir)
+    }
+
+    /// Returns the root directory of the process
+    pub fn root(&self) -> &VnodeWithPath {
+        VnodeWithPath::ref_cast(&self.raw.pvi_rdir)
     }
 }

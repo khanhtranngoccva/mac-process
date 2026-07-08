@@ -1,4 +1,4 @@
-//! High level audit token module that more stably identifies a process/task 
+//! High level audit token module that more stably identifies a process/task
 use crate::libproc::{
     bindings::{au_asid_t, audit_token_t},
     mach,
@@ -7,7 +7,10 @@ use rustix::{
     fs::{Gid, Uid},
     process::Pid,
 };
-use std::hash::{Hash, Hasher};
+use std::{
+    hash::{Hash, Hasher},
+    num::TryFromIntError,
+};
 
 /// The audit token is an opaque token which identifies Mach tasks and senders of Mach messages
 /// as subjects to the BSM audit system.  Only the appropriate BSM library routines should
@@ -94,9 +97,9 @@ impl AuditToken {
     ///
     /// **NOTE**: Used to identify Mach tasks and senders of Mach messages as subjects of the audit system.
     #[inline(always)]
-    pub fn pid(&self) -> Pid {
+    pub fn pid(&self) -> Result<u32, TryFromIntError> {
         // Safety: The audit_token_t is owned by self.
-        unsafe { Pid::from_raw_unchecked(mach::audit_token_to_pid(self.raw)) }
+        unsafe { mach::audit_token_to_pid(self.raw).try_into() }
     }
 
     /// The audit session ID.

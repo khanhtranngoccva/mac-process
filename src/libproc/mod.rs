@@ -13,6 +13,8 @@ pub mod task_info;
 pub mod thread_info;
 pub mod work_queue_info;
 pub mod mach;
+pub mod vnode_info;
+pub mod args;
 
 #[allow(warnings, missing_docs)]
 pub mod bindings {

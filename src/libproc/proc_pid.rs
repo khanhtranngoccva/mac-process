@@ -397,8 +397,9 @@ pub fn pidpath_audittoken(mut audit_token: audit_token_t) -> Result<PathBuf, io:
     // PROC_PIDPATHINFO_MAXSIZE will be smaller than `u32::MAX`
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let buffer_size = buf.capacity() as u32;
-    let ret =
-        syscall::cvt_positive(unsafe { proc_pidpath_audittoken(&mut audit_token, buffer_ptr, buffer_size as _) })? as usize;
+    let ret = syscall::cvt_positive(unsafe {
+        proc_pidpath_audittoken(&mut audit_token, buffer_ptr, buffer_size as _)
+    })? as usize;
     unsafe { buf.set_len(ret) };
     Ok(PathBuf::from(OsString::from_vec(buf)))
 }
@@ -638,12 +639,70 @@ pub fn am_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
 
+/// Get the environment variables for a process using an undocumented syscall
+pub fn proc_args2_raw(pid: pid_t) -> Result<Vec<u8>, io::Error> {
+    // https://chromium.googlesource.com/crashpad/crashpad/+/refs/heads/master/util/posix/process_info_mac.cc
+    let mut size_estimate: usize = 0;
+    let mut size: usize;
+
+    const PROC_ARGS2: c_int = 49;
+
+    let mut mib: [c_int; _] = [libc::CTL_KERN, PROC_ARGS2, pid];
+    let mut buf = vec![0u8; 0];
+
+    loop {
+        // Perform initial allocation
+        syscall::cvt_nonnegative(unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                std::ptr::null_mut(),
+                &mut size_estimate,
+                std::ptr::null_mut(),
+                0,
+            )
+        })?;
+        size = size_estimate + 32;
+        buf.resize(size, 0);
+        // Perform actual retrieval
+        match syscall::cvt_nonnegative(unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        }) {
+            Ok(_) => {
+                if size > size_estimate {
+                    // Retry to prevent a race condition
+                    continue;
+                }
+                buf.truncate(size);
+                break;
+            }
+            // ENOMEM: oldlenp is too small
+            Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+                continue;
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        };
+    }
+    Ok(buf)
+}
+
 // run tests with 'cargo test -- --nocapture' to see the test output
 #[cfg(test)]
 // Don't worry about wrapping in tests
 #[allow(clippy::cast_possible_wrap)]
 mod test {
     use std::env;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
     use std::path::Path;
     use std::process;
 
@@ -654,7 +713,7 @@ mod test {
     use crate::libproc::task_info::TaskAllInfo;
 
     use super::am_root;
-    use super::{ListThreads, libversion, listpidinfo, pidinfo};
+    use super::{ListThreads, libversion, listpidinfo, pidinfo, proc_args2_raw};
     use super::{cwdself, name, pidpath};
     use crate::libproc::task_info::TaskInfo;
     use crate::libproc::thread_info::ThreadInfo;
@@ -821,5 +880,14 @@ mod test {
         } else {
             println!("You are not root");
         }
+    }
+
+    #[test]
+    fn env_test() {
+        let pid = process::id() as i32;
+        let env = proc_args2_raw(pid).expect("Failed to get environment");
+        println!("Environment: {:?}", env);
+        let what = OsString::from_vec(env);
+        println!("Environment: {:?}", what);
     }
 }

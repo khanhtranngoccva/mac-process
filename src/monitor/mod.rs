@@ -1,4 +1,5 @@
 //! A high-level process monitor for a process.
+pub mod args;
 pub mod audit_token;
 mod dead_processes;
 pub mod region_iterator;
@@ -7,10 +8,16 @@ pub mod vnode;
 
 use crate::{
     helpers::hashes,
-    libproc::region_info::{RegionInfo, RegionWithPathInfo},
+    libproc::{
+        args::ProcArgs2,
+        bindings::proc_vnodepathinfo,
+        bsd_info::BSDInfo,
+        region_info::{RegionInfo, RegionWithPathInfo},
+    },
     monitor::{
+        args::ProcessArgInfo,
         regions::{Region, RegionWithPath},
-        vnode::VnodeStat,
+        vnode::{Openable, ProcessVnodePaths, VnodeStat, VnodeWithPath},
     },
 };
 use audit_token::AuditToken;
@@ -20,10 +27,11 @@ use dead_processes::{DeadProcTracker, WatchItem};
 use once_cell::sync::OnceCell;
 use region_iterator::{RegionIterator, RegionWithPathIterator};
 use rustix::{
-    fs::{Dev, Mode, OFlags},
+    fs::{Dev, Gid, OFlags, Uid},
     process::Pid,
 };
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     fmt::Debug,
     fs::File,
@@ -99,7 +107,9 @@ impl ProcessMonitor {
 pub struct Process {
     pid: Pid,
     audit_token: AuditToken,
+    /// The executable path of the process.
     path: OnceCell<PathBuf>,
+    /// The name of the process.
     name: OnceCell<OsString>,
     /// The identity of the main executable is a tuple of the device and inode.
     exe_identity: OnceCell<(Dev, u64)>,
@@ -195,7 +205,9 @@ impl Process {
 
     /// Checks if the process is alive.
     pub fn is_alive(&self) -> bool {
-        // Paranoid check in case pid_version loops back.
+        // The alive check uses 2 mechanisms:
+        // - The audit_token querying mechanism. If the process behind the PID is dead without any other processes reusing its PID, the audit token cannot be queried. If the audit token is queried and but the PID version mismatches, the process is implied dead.
+        // - In case a threat actor attempts to cycle through the 32-bit PID version namespace to replace itself, the kqueue should generally be able to mark the process as dead long before the attempt is complete.
         if !self.kqueue_alive.load(Ordering::Acquire) {
             return false;
         }
@@ -239,13 +251,32 @@ impl Process {
         })
     }
 
-    /// Gets the path of the process. This property is cached.
+    /// Gets the path of the process (alias of [`Self::exe_path`]). This property is cached.
+    #[inline]
     pub fn path(&self) -> Result<&Path, io::Error> {
+        self.exe_path()
+    }
+
+    /// Gets the path of the main executable of the process. This property is cached.
+    pub fn exe_path(&self) -> Result<&Path, io::Error> {
         self.evaluate_cached(&self.path, || {
             let path = crate::libproc::proc_pid::pidpath_audittoken(*self.audit_token.raw_token())?;
             Ok(path)
         })
         .map(|path| path.as_path())
+    }
+
+    /// Gets the path of the main executable of the process without caching. This allows the caller to retrieve the executable path again in case it is stale.
+    pub fn exe_path_uncached(&self) -> Result<PathBuf, io::Error> {
+        let path = crate::libproc::proc_pid::pidpath_audittoken(*self.audit_token.raw_token())?;
+        // Sanity check to prevent returning a path for a dead process or another process.
+        if !self.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not alive",
+            ));
+        }
+        Ok(path)
     }
 
     /// Gets the name of the process. This property is cached.
@@ -257,9 +288,85 @@ impl Process {
         .map(|name| name.as_os_str())
     }
 
+    /// Gets the name of the process without caching. This allows the caller to retrieve the process name again in case it is stale.
+    pub fn name_uncached(&self) -> Result<OsString, io::Error> {
+        let name = crate::libproc::proc_pid::name(self.pid.as_raw_pid())?;
+        // Sanity check to prevent returning a name for a dead process or another process.
+        if !self.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not alive",
+            ));
+        }
+        Ok(name)
+    }
+
     /// Gets the PID of the process.
     pub fn pid(&self) -> Pid {
         self.pid
+    }
+
+    /// Gets the parent PID of the process.
+    ///
+    /// # Notes
+    /// - The function does not return in the [`Pid`] type because macOS also has PID 0.
+    pub fn ppid(&self) -> Result<u32, io::Error> {
+        let info = crate::libproc::proc_pid::pidinfo::<BSDInfo>(self.pid.as_raw_pid(), 0)?;
+        if !self.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not alive",
+            ));
+        }
+        Ok(info.pbi_ppid)
+    }
+
+    /// Gets the UID of the process.
+    pub fn uid(&self) -> Result<Uid, io::Error> {
+        let info = crate::libproc::proc_pid::pidinfo::<BSDInfo>(self.pid.as_raw_pid(), 0)?;
+        if !self.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not alive",
+            ));
+        }
+        Ok(Uid::from_raw_unchecked(info.pbi_uid))
+    }
+
+    /// Gets the real UID of the process.
+    pub fn ruid(&self) -> Result<Uid, io::Error> {
+        let info = crate::libproc::proc_pid::pidinfo::<BSDInfo>(self.pid.as_raw_pid(), 0)?;
+        if !self.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not alive",
+            ));
+        }
+        Ok(Uid::from_raw_unchecked(info.pbi_ruid))
+    }
+
+    /// Gets the GID of the process.
+    pub fn gid(&self) -> Result<Gid, io::Error> {
+        let info = crate::libproc::proc_pid::pidinfo::<BSDInfo>(self.pid.as_raw_pid(), 0)?;
+        if !self.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not alive",
+            ));
+        }
+        Ok(Gid::from_raw_unchecked(info.pbi_gid))
+    }
+
+    /// Gets the real GID of the process.
+    pub fn rgid(&self) -> Result<Gid, io::Error> {
+        let info = crate::libproc::proc_pid::pidinfo::<BSDInfo>(self.pid.as_raw_pid(), 0)?;
+        if !self.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not alive",
+            ));
+        }
+        Ok(Gid::from_raw_unchecked(info.pbi_rgid))
     }
 
     /// Gets the audit token of the process.
@@ -336,11 +443,15 @@ impl Process {
     pub fn exe_identity(&self) -> Result<(Dev, u64), io::Error> {
         self.evaluate_cached(&self.exe_identity, || {
             let stats = self.exe_stats()?;
-            let dev = stats.dev();
-            let ino = stats.ino();
-            Ok((dev, ino))
+            Ok(stats.identity())
         })
         .cloned()
+    }
+
+    /// Retrieves the identity of the main executable without caching. This allows the caller to retrieve the executable identity again in case it is stale.
+    pub fn exe_identity_uncached(&self) -> Result<(Dev, u64), io::Error> {
+        let stats = self.exe_stats()?;
+        Ok(stats.identity())
     }
 
     /// Opens the main executable of the process as a file by using volfs (/.vol) as a [`File`].
@@ -353,12 +464,9 @@ impl Process {
     /// Opens the main executable of the process as a file by using volfs (/.vol) as a [`OwnedFd`].
     /// Note that behavior may be unpredictable if the volume directory is shadowed or locked
     pub fn open_exe_fd(&self, flags: OFlags) -> Result<OwnedFd, io::Error> {
-        let (dev, ino) = self.exe_identity()?;
-        let stable_path = Path::new("/.vol")
-            .join(dev.to_string())
-            .join(ino.to_string());
-        let owned_fd = rustix::fs::open(&stable_path, flags, Mode::empty())?;
-        Ok(owned_fd)
+        let region = self.exe_region()?;
+        let vnode = region.vnode();
+        vnode.open(flags)
     }
 
     /// Computes the MD5 hash of the main executable. This property is cached.
@@ -392,6 +500,92 @@ impl Process {
     pub fn exe_sha256(&self) -> Result<[u8; 32], io::Error> {
         self.sha256_exe()
     }
+
+    /// Retrieves the path information of the process.
+    #[inline]
+    pub fn vnode_path_info(&self) -> Result<ProcessVnodePaths, io::Error> {
+        let vnode_path_info =
+            crate::libproc::proc_pid::pidinfo::<proc_vnodepathinfo>(self.pid.as_raw_pid(), 0)?;
+        // Sanity check to prevent returning a vnode path info for a dead process or another process.
+        if !self.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not alive",
+            ));
+        }
+        Ok(ProcessVnodePaths::from_raw(vnode_path_info))
+    }
+
+    /// Retrieves the current working directory information of the process.
+    #[inline]
+    pub fn cwd(&self) -> Result<VnodeWithPath, io::Error> {
+        let cwd = *self.vnode_path_info()?.cwd();
+        Ok(cwd)
+    }
+
+    /// Retrieves the current working directory path of the process.
+    ///
+    /// This is shorthand for `process.cwd().path()`
+    #[inline]
+    pub fn cwd_path(&self) -> Result<PathBuf, io::Error> {
+        self.cwd().map(|cwd| cwd.path().to_path_buf())
+    }
+
+    /// Opens the cwd as an [`OwnedFd`].
+    ///
+    /// Note that behavior may be unpredictable if the volume directory is shadowed or locked
+    pub fn open_cwd(&self, flags: OFlags) -> Result<OwnedFd, io::Error> {
+        let cwd = self.cwd()?;
+        cwd.open(flags)
+    }
+
+    /// Retrieves the root directory information of the process.
+    #[inline]
+    pub fn root(&self) -> Result<VnodeWithPath, io::Error> {
+        let root = *self.vnode_path_info()?.root();
+        Ok(root)
+    }
+
+    /// Retrieves the root directory path of the process.
+    ///
+    /// This is shorthand for `process.root().path()`
+    #[inline]
+    pub fn root_path(&self) -> Result<PathBuf, io::Error> {
+        self.root().map(|root| root.path().to_path_buf())
+    }
+
+    /// Opens the root as an [`OwnedFd`].
+    ///
+    /// Note that behavior may be unpredictable if the volume directory is shadowed or locked
+    pub fn open_root(&self, flags: OFlags) -> Result<OwnedFd, io::Error> {
+        let root = self.root()?;
+        root.open(flags)
+    }
+
+    /// Retrieves the arguments and environment variables of the process.
+    pub fn arg_info(&self) -> Result<ProcessArgInfo, io::Error> {
+        let raw = crate::libproc::proc_pid::proc_args2_raw(self.pid.as_raw_pid())?;
+        if !self.is_alive() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is not alive",
+            ));
+        }
+        let args = ProcessArgInfo::parse(&ProcArgs2::from_raw(&raw)?);
+        Ok(args)
+    }
+
+    /// Retrieves the process' command line arguments.
+    pub fn args(&self) -> Result<Vec<OsString>, io::Error> {
+        let args = self.arg_info()?.args;
+        Ok(args)
+    }
+
+    /// Retrieves the process' environment variables.
+    pub fn env(&self) -> Result<HashMap<OsString, OsString>, io::Error> {
+        let environment = self.arg_info()?.environment;
+        Ok(environment)
+    }
 }
 
 impl Drop for Process {
@@ -414,6 +608,7 @@ fn spawn_example_process() -> Child {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::piped())
+        .env("malformed\"", "env_var")
         .spawn()
         .expect("Failed to spawn process")
 }
@@ -468,9 +663,7 @@ mod tests {
             .expect("failed to get process");
         let audit_token = process.audit_token();
         println!("Audit token: {:?}", audit_token);
-        assert!(
-            audit_token.pid() == Pid::from_raw(child_pid as i32).expect("failed to convert pid")
-        );
+        assert!(audit_token.pid().expect("failed to retrieve ID") == child_pid);
         child.kill().expect("failed to kill process");
         let _ = child.wait_with_output();
     }
@@ -513,5 +706,19 @@ mod tests {
         println!("SHA256 hash (original): {:?}", sha256_original);
         assert!(md5 == md5_original);
         assert!(sha256 == sha256_original);
+    }
+
+    #[test]
+    fn test_arg_info() {
+        let mut child = spawn_example_process();
+        let child_pid = child.id();
+        let integrity = ProcessMonitor::new().expect("failed to create integrity object");
+        let process = integrity
+            .get(Pid::from_raw(child_pid as i32).expect("failed to convert pid"))
+            .expect("failed to get process");
+        let arg_info = process.arg_info().expect("failed to get arg info");
+        println!("Arg info: {:?}", arg_info);
+        child.kill().expect("failed to kill process");
+        let _ = child.wait_with_output();
     }
 }
