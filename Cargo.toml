@@ -27,4 +27,4 @@ system_error = "0.2.0"
 tempfile = "3.27.0"
 
 [build-dependencies]
-bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }
+bindgen = { version = "0.73.1", default-features = false, features = ["runtime"] }
